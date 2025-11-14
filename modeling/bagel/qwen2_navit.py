@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from functools import partial
 from typing import List, Optional, Tuple
 
+import math
 import torch
 from torch import nn
 from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -41,6 +42,103 @@ torch._dynamo.config.cache_size_limit = 512
 torch._dynamo.config.accumulated_cache_size_limit = 4096
 # flex_attention = torch.compile(flex_attention) # , dynamic=True, mode='max-autotune'
 flex_attention = torch.compile(flex_attention)
+
+
+_ATTENTION_VIS_ENABLED: bool = False
+_ATTENTION_VIS_VECTORS: list = []
+
+
+def _enable_attention_vis_logging(flag: bool, clear: bool = False) -> None:
+    global _ATTENTION_VIS_ENABLED, _ATTENTION_VIS_VECTORS
+    _ATTENTION_VIS_ENABLED = bool(flag)
+    if clear:
+        _ATTENTION_VIS_VECTORS = []
+
+
+def _append_attention_vis_vector(vec: torch.Tensor) -> None:
+    global _ATTENTION_VIS_VECTORS
+    if not _ATTENTION_VIS_ENABLED:
+        return
+    if vec is None:
+        return
+    vec = vec.detach().float().cpu()
+    if vec.numel() == 0:
+        return
+    if len(_ATTENTION_VIS_VECTORS) >= 128:
+        _ATTENTION_VIS_VECTORS.pop(0)
+    _ATTENTION_VIS_VECTORS.append(vec)
+
+
+def _log_attention_for_vis_step(
+    packed_query_states: torch.Tensor,
+    packed_key_states: torch.Tensor,
+    packed_vae_token_indexes: Optional[torch.LongTensor],
+    packed_text_indexes: Optional[torch.LongTensor],
+) -> None:
+    """Approximate text→image relevance over VAE tokens for visualization.
+
+    This is a lightweight, best-effort helper used by MoT attention layers.
+    It only does real work when global logging is enabled, and any error is
+    swallowed so normal generation is never affected.
+    """
+
+    if not _ATTENTION_VIS_ENABLED:
+        return
+
+    if packed_vae_token_indexes is None or packed_text_indexes is None:
+        return
+
+    try:
+        q = packed_query_states  # (T_total, num_heads, head_dim)
+        k = packed_key_states    # (T_total, num_kv_heads, head_dim)
+        if q.ndim != 3 or k.ndim != 3:
+            return
+
+        # Indices should be 1D longs.
+        text_idx = packed_text_indexes.detach().long().view(-1)
+        vae_idx = packed_vae_token_indexes.detach().long().view(-1)
+        if text_idx.numel() == 0 or vae_idx.numel() == 0:
+            return
+
+        # Select the current-step text / VAE token representations.
+        q_text = q[text_idx]  # (T_text, H, D)
+        k_vae = k[vae_idx]    # (T_vae, H_kv, D)
+
+        T_text, H_q, D = q_text.shape
+        T_vae, H_kv, Dk = k_vae.shape
+        if Dk != D or T_text == 0 or T_vae == 0:
+            return
+
+        # Match key heads to query heads (GQA/MoE) by repeating groups.
+        if H_kv != H_q:
+            if H_kv == 0 or H_q % H_kv != 0:
+                return
+            repeat = H_q // H_kv
+            k_vae = k_vae.repeat_interleave(repeat, dim=1)
+
+        # Compute approximate cross-attention: q·k^T / sqrt(d), then mean
+        # over text tokens and heads → (T_vae,).
+        q_text_heads = q_text  # (T_text, H, D)
+        k_vae_heads = k_vae    # (T_vae, H, D)
+
+        q_flat = q_text_heads.permute(1, 0, 2).reshape(H_q, T_text, D)
+        k_flat = k_vae_heads.permute(1, 0, 2).reshape(H_q, T_vae, D)
+
+        scores = torch.matmul(q_flat, k_flat.transpose(-1, -2)) / math.sqrt(D)
+        relevance = scores.mean(dim=1).mean(dim=0)  # (T_vae,)
+
+        relevance = relevance.detach().float()
+        if relevance.numel() == 0:
+            return
+        rel_min = float(relevance.min().item())
+        rel_max = float(relevance.max().item())
+        if rel_max - rel_min > 1e-8:
+            relevance = (relevance - rel_min) / (rel_max - rel_min)
+
+        _append_attention_vis_vector(relevance)
+    except Exception:
+        # Never break the main generation path due to visualization issues.
+        return
 
 
 class Qwen2Config(_Qwen2Config):
@@ -338,6 +436,26 @@ class PackedAttention(Qwen2Attention):
         packed_key_states = packed_key_states.to(torch.bfloat16)
         packed_value_states = packed_value_states.to(torch.bfloat16)
 
+        # Lightweight visualization hook for MoT path: when global logging
+        # is enabled and we are in generation mode, compute an approximate
+        # text→image relevance vector over current VAE tokens.
+        _log_attention_for_vis_step(
+            packed_query_states,
+            packed_key_states,
+            packed_vae_token_indexes,
+            packed_text_indexes,
+        )
+
+        # Lightweight visualization hook: when global logging is enabled and
+        # MoT is in generation mode, compute an approximate text→image
+        # relevance vector over current VAE tokens.
+        _log_attention_for_vis_step(
+            packed_query_states,
+            packed_key_states,
+            packed_vae_token_indexes,
+            packed_text_indexes,
+        )
+
         if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
             past_key_states = past_key_values.key_cache[self.layer_idx]
             past_value_states = past_key_values.value_cache[self.layer_idx]
@@ -375,9 +493,6 @@ class PackedAttention(Qwen2Attention):
             past_key_values.key_cache[self.layer_idx] = merged_key_states
             past_key_values.value_cache[self.layer_idx] = merged_value_states
 
-        return packed_attn_output, past_key_values
-
-
 class PackedAttentionMoT(Qwen2Attention):
     def __init__(self, config, layer_idx: Optional[int] = None):
         super().__init__(config, layer_idx)
@@ -396,6 +511,13 @@ class PackedAttentionMoT(Qwen2Attention):
         self.k_proj_moe_gen = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         self.v_proj_moe_gen = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=True)
         self.o_proj_moe_gen = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+
+        # Optional back-reference to the owning Qwen2Model for visualization.
+        # This is populated in Qwen2Model.__init__ and is a no-op for normal
+        # inference; it is only used when log_attention_for_vis is turned on.
+        # Note: we intentionally use a plain Python attribute name that Torch
+        # does not treat as a child Module to avoid recursive module graphs.
+        self._vis_owner_model = None
 
     def forward(self, *args, **kwargs):
         if self.training:
@@ -555,6 +677,19 @@ class PackedAttentionMoT(Qwen2Attention):
         packed_query_states = packed_query_states.to(torch.bfloat16)
         packed_key_states = packed_key_states.to(torch.bfloat16)
         packed_value_states = packed_value_states.to(torch.bfloat16)
+
+        # Lightweight visualization hook: only meaningful in MoT generation
+        # mode, where packed_vae_token_indexes / packed_text_indexes are
+        # provided. This computes an approximate text→image relevance vector
+        # over VAE tokens and appends it to the global vis buffer when
+        # logging is enabled.
+        if mode == 'gen':
+            _log_attention_for_vis_step(
+                packed_query_states,
+                packed_key_states,
+                packed_vae_token_indexes,
+                packed_text_indexes,
+            )
 
         if past_key_values is not None and past_key_values.key_cache[self.layer_idx] is not None:
             past_key_states = past_key_values.key_cache[self.layer_idx]
@@ -947,10 +1082,12 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.vocab_size = config.vocab_size
         self.use_moe = 'Mo' in config.layer_module
 
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.embed_tokens = nn.Embedding(
+            config.vocab_size, config.hidden_size, self.padding_idx)
         layer_module = Decoder_layer_dict[config.layer_module]
         self.layers = nn.ModuleList(
-            [layer_module(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [layer_module(config, layer_idx)
+             for layer_idx in range(config.num_hidden_layers)]
         )
 
         self.norm = Qwen2RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -960,6 +1097,22 @@ class Qwen2Model(Qwen2PreTrainedModel):
 
         # Initialize weights and apply final processing
         self.post_init()
+
+        # Lightweight hooks for visualization-only attention logging.
+        # These flags are no-ops unless explicitly enabled by downstream code
+        # (e.g. UMM Bagel visualization pipeline).
+        self.log_attention_for_vis: bool = False
+        self.attention_vectors_for_vis: list = []
+
+    def clear_attention_logs_for_vis(self) -> None:
+        """Clear stored attention vectors used only for visualization.
+
+        This helper is safe to call at any time and does not affect model
+        weights or normal generation behavior.
+        """
+        self.attention_vectors_for_vis = []
+        # Also clear any global visualization buffer to keep them in sync.
+        _enable_attention_vis_logging(False, clear=True)
 
     def forward(self, *args, **kwargs):
         if self.training:
@@ -1030,7 +1183,13 @@ class Qwen2Model(Qwen2PreTrainedModel):
         packed_vae_token_indexes=None,
         packed_text_indexes=None,
     ) -> BaseNavitOutputWithPast:
-        
+        # Optionally enable lightweight global attention logging for
+        # visualization. This does not affect the main generation path.
+        if self.log_attention_for_vis:
+            _enable_attention_vis_logging(True, clear=False)
+        else:
+            _enable_attention_vis_logging(False, clear=False)
+
         enable_taylorseer = getattr(self, 'enable_taylorseer', False)
         if enable_taylorseer:
             cal_type(self.cache_dic, self.current)
@@ -1085,6 +1244,15 @@ class Qwen2Model(Qwen2PreTrainedModel):
         
         if enable_taylorseer:
             self.current['step'] += 1
+        
+        # Snapshot any collected visualization vectors into the model-level
+        # buffer so that downstream consumers (e.g. UMM) can access them.
+        global _ATTENTION_VIS_VECTORS
+        if self.log_attention_for_vis:
+            # Make a shallow copy to decouple from the global buffer.
+            self.attention_vectors_for_vis = list(_ATTENTION_VIS_VECTORS)
+        else:
+            self.attention_vectors_for_vis = []
 
         return BaseNavitOutputWithPast(
             packed_query_sequence=packed_query_sequence,
