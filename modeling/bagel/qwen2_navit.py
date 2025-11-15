@@ -46,6 +46,7 @@ flex_attention = torch.compile(flex_attention)
 
 _ATTENTION_VIS_ENABLED: bool = False
 _ATTENTION_VIS_VECTORS: list = []
+_ATTENTION_VIS_TOKEN_MAPS: list = []
 
 # Global switch and buffer for gradient-based attention guidance. This is
 # intentionally separate from the visualization buffer so that guidance code
@@ -53,20 +54,23 @@ _ATTENTION_VIS_VECTORS: list = []
 # continue to use lightweight detached copies.
 _ATTENTION_GUIDANCE_ENABLED: bool = False
 _LAST_GUIDANCE_RELEVANCE: Optional[torch.Tensor] = None
+_LAST_GUIDANCE_TOKEN_RELEVANCE: Optional[torch.Tensor] = None
 
 
 def _enable_attention_vis_logging(flag: bool, clear: bool = False) -> None:
-    global _ATTENTION_VIS_ENABLED, _ATTENTION_VIS_VECTORS
+    global _ATTENTION_VIS_ENABLED, _ATTENTION_VIS_VECTORS, _ATTENTION_VIS_TOKEN_MAPS
     _ATTENTION_VIS_ENABLED = bool(flag)
     if clear:
         _ATTENTION_VIS_VECTORS = []
+        _ATTENTION_VIS_TOKEN_MAPS = []
 
 
 def _enable_attention_guidance_logging(flag: bool, clear: bool = False) -> None:
-    global _ATTENTION_GUIDANCE_ENABLED, _LAST_GUIDANCE_RELEVANCE
+    global _ATTENTION_GUIDANCE_ENABLED, _LAST_GUIDANCE_RELEVANCE, _LAST_GUIDANCE_TOKEN_RELEVANCE
     _ATTENTION_GUIDANCE_ENABLED = bool(flag)
     if clear:
         _LAST_GUIDANCE_RELEVANCE = None
+        _LAST_GUIDANCE_TOKEN_RELEVANCE = None
 
 
 def _append_attention_vis_vector(vec: torch.Tensor) -> None:
@@ -81,6 +85,20 @@ def _append_attention_vis_vector(vec: torch.Tensor) -> None:
     if len(_ATTENTION_VIS_VECTORS) >= 128:
         _ATTENTION_VIS_VECTORS.pop(0)
     _ATTENTION_VIS_VECTORS.append(vec)
+
+
+def _append_attention_vis_token_map(mat: torch.Tensor) -> None:
+    global _ATTENTION_VIS_TOKEN_MAPS
+    if not _ATTENTION_VIS_ENABLED:
+        return
+    if mat is None:
+        return
+    mat = mat.detach().float().cpu()
+    if mat.numel() == 0:
+        return
+    if len(_ATTENTION_VIS_TOKEN_MAPS) >= 128:
+        _ATTENTION_VIS_TOKEN_MAPS.pop(0)
+    _ATTENTION_VIS_TOKEN_MAPS.append(mat)
 
 
 def _log_attention_for_vis_step(
@@ -144,6 +162,7 @@ def _log_attention_for_vis_step(
 
         scores = torch.matmul(q_flat, k_flat.transpose(-1, -2)) / math.sqrt(D)
         relevance = scores.mean(dim=1).mean(dim=0)  # (T_vae,)
+        token_relevance = scores.mean(dim=0).mean(dim=-1)  # (T_text,)
 
         if relevance.numel() == 0:
             return
@@ -154,6 +173,15 @@ def _log_attention_for_vis_step(
         if rel_max - rel_min > 1e-8:
             relevance = (relevance - rel_min) / (rel_max - rel_min)
 
+        if token_relevance.numel() > 0:
+            token_relevance = token_relevance.to(torch.float32)
+            tok_min = float(token_relevance.min().item())
+            tok_max = float(token_relevance.max().item())
+            if tok_max - tok_min > 1e-8:
+                token_relevance = (token_relevance - tok_min) / (tok_max - tok_min)
+        else:
+            token_relevance = None
+
         # For gradient-based guidance, keep a full-precision tensor alive for
         # the current step. When multiple attention modules call this helper
         # within a single step, we progressively average their contributions.
@@ -162,10 +190,22 @@ def _log_attention_for_vis_step(
                 _LAST_GUIDANCE_RELEVANCE = relevance
             else:
                 _LAST_GUIDANCE_RELEVANCE = 0.5 * _LAST_GUIDANCE_RELEVANCE + 0.5 * relevance
+            if token_relevance is not None:
+                global _LAST_GUIDANCE_TOKEN_RELEVANCE
+                if _LAST_GUIDANCE_TOKEN_RELEVANCE is None:
+                    _LAST_GUIDANCE_TOKEN_RELEVANCE = token_relevance
+                else:
+                    _LAST_GUIDANCE_TOKEN_RELEVANCE = (
+                        0.5 * _LAST_GUIDANCE_TOKEN_RELEVANCE + 0.5 * token_relevance
+                    )
+            else:
+                _LAST_GUIDANCE_TOKEN_RELEVANCE = None
 
         # For visualization, store a detached CPU copy in the global buffer.
         if _ATTENTION_VIS_ENABLED:
             _append_attention_vis_vector(relevance)
+            if token_relevance is not None:
+                _append_attention_vis_token_map(token_relevance)
     except Exception:
         # Never break the main generation path due to visualization/guidance
         # hooks.
@@ -1136,6 +1176,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         # (e.g. UMM Bagel visualization pipeline).
         self.log_attention_for_vis: bool = False
         self.attention_vectors_for_vis: list = []
+        self.attention_token_vectors_for_vis: list = []
 
     def clear_attention_logs_for_vis(self) -> None:
         """Clear stored attention vectors used only for visualization.
@@ -1144,6 +1185,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         weights or normal generation behavior.
         """
         self.attention_vectors_for_vis = []
+        self.attention_token_vectors_for_vis = []
         # Also clear any global visualization buffer to keep them in sync.
         _enable_attention_vis_logging(False, clear=True)
 
@@ -1280,12 +1322,14 @@ class Qwen2Model(Qwen2PreTrainedModel):
         
         # Snapshot any collected visualization vectors into the model-level
         # buffer so that downstream consumers (e.g. UMM) can access them.
-        global _ATTENTION_VIS_VECTORS
+        global _ATTENTION_VIS_VECTORS, _ATTENTION_VIS_TOKEN_MAPS
         if self.log_attention_for_vis:
             # Make a shallow copy to decouple from the global buffer.
             self.attention_vectors_for_vis = list(_ATTENTION_VIS_VECTORS)
+            self.attention_token_vectors_for_vis = list(_ATTENTION_VIS_TOKEN_MAPS)
         else:
             self.attention_vectors_for_vis = []
+            self.attention_token_vectors_for_vis = []
 
         return BaseNavitOutputWithPast(
             packed_query_sequence=packed_query_sequence,
