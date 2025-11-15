@@ -178,6 +178,16 @@ class InterleaveInferencer:
         latent = latent.reshape(1, h, w, self.model.latent_patch_size, self.model.latent_patch_size, self.model.latent_channel)
         latent = torch.einsum("nhwpqc->nchpwq", latent)
         latent = latent.reshape(1, self.model.latent_channel, h * self.model.latent_patch_size, w * self.model.latent_patch_size)
+        # 确保送入 VAE 的 latent 与 VAE 权重的 device/dtype 一致，避免 conv2d 报错
+        try:
+            vae_param = next(self.vae_model.parameters())
+            vae_dtype = vae_param.dtype
+            vae_device = vae_param.device
+        except StopIteration:
+            vae_dtype = latent.dtype
+            vae_device = latent.device
+        if latent.dtype != vae_dtype or latent.device != vae_device:
+            latent = latent.to(device=vae_device, dtype=vae_dtype)
         image = self.vae_model.decode(latent)
         image = (image * 0.5 + 0.5).clamp(0, 1)[0].permute(1, 2, 0) * 255
         image = Image.fromarray((image).to(torch.uint8).cpu().numpy())

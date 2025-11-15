@@ -106,14 +106,6 @@ class TimestepEmbedder(nn.Module):
 
     def forward(self, t):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        # 在部分推理路径（如 UMM inner guidance）中可能未启用 autocast，而权重是
-        # bfloat16/float16，这里显式对齐到 MLP 参数 dtype，避免 matmul Float/BFloat16 冲突。
-        try:
-            param_dtype = next(self.mlp.parameters()).dtype
-        except StopIteration:
-            param_dtype = t_freq.dtype
-        if t_freq.dtype != param_dtype:
-            t_freq = t_freq.to(param_dtype)
         t_emb = self.mlp(t_freq)
         return t_emb
 
