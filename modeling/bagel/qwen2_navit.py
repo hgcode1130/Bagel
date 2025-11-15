@@ -47,12 +47,26 @@ flex_attention = torch.compile(flex_attention)
 _ATTENTION_VIS_ENABLED: bool = False
 _ATTENTION_VIS_VECTORS: list = []
 
+# Global switch and buffer for gradient-based attention guidance. This is
+# intentionally separate from the visualization buffer so that guidance code
+# can work with full-precision, non-detached tensors while visualization can
+# continue to use lightweight detached copies.
+_ATTENTION_GUIDANCE_ENABLED: bool = False
+_LAST_GUIDANCE_RELEVANCE: Optional[torch.Tensor] = None
+
 
 def _enable_attention_vis_logging(flag: bool, clear: bool = False) -> None:
     global _ATTENTION_VIS_ENABLED, _ATTENTION_VIS_VECTORS
     _ATTENTION_VIS_ENABLED = bool(flag)
     if clear:
         _ATTENTION_VIS_VECTORS = []
+
+
+def _enable_attention_guidance_logging(flag: bool, clear: bool = False) -> None:
+    global _ATTENTION_GUIDANCE_ENABLED, _LAST_GUIDANCE_RELEVANCE
+    _ATTENTION_GUIDANCE_ENABLED = bool(flag)
+    if clear:
+        _LAST_GUIDANCE_RELEVANCE = None
 
 
 def _append_attention_vis_vector(vec: torch.Tensor) -> None:
@@ -75,18 +89,22 @@ def _log_attention_for_vis_step(
     packed_vae_token_indexes: Optional[torch.LongTensor],
     packed_text_indexes: Optional[torch.LongTensor],
 ) -> None:
-    """Approximate text→image relevance over VAE tokens for visualization.
+    """Approximate text→image relevance over VAE tokens.
 
-    This is a lightweight, best-effort helper used by MoT attention layers.
-    It only does real work when global logging is enabled, and any error is
-    swallowed so normal generation is never affected.
+    This helper is used both for lightweight visualization (detached copies
+    stored in a global buffer) and for gradient-based guidance, where a
+    full-precision tensor is kept alive for the current step.
     """
 
-    if not _ATTENTION_VIS_ENABLED:
+    # Fast path: nothing to do if neither visualization nor guidance is
+    # enabled at the module level.
+    if not _ATTENTION_VIS_ENABLED and not _ATTENTION_GUIDANCE_ENABLED:
         return
 
     if packed_vae_token_indexes is None or packed_text_indexes is None:
         return
+
+    global _LAST_GUIDANCE_RELEVANCE
 
     try:
         q = packed_query_states  # (T_total, num_heads, head_dim)
@@ -127,17 +145,30 @@ def _log_attention_for_vis_step(
         scores = torch.matmul(q_flat, k_flat.transpose(-1, -2)) / math.sqrt(D)
         relevance = scores.mean(dim=1).mean(dim=0)  # (T_vae,)
 
-        relevance = relevance.detach().float()
         if relevance.numel() == 0:
             return
+        # Normalize to [0,1] for both visualization and guidance.
+        relevance = relevance.to(torch.float32)
         rel_min = float(relevance.min().item())
         rel_max = float(relevance.max().item())
         if rel_max - rel_min > 1e-8:
             relevance = (relevance - rel_min) / (rel_max - rel_min)
 
-        _append_attention_vis_vector(relevance)
+        # For gradient-based guidance, keep a full-precision tensor alive for
+        # the current step. When multiple attention modules call this helper
+        # within a single step, we progressively average their contributions.
+        if _ATTENTION_GUIDANCE_ENABLED:
+            if _LAST_GUIDANCE_RELEVANCE is None:
+                _LAST_GUIDANCE_RELEVANCE = relevance
+            else:
+                _LAST_GUIDANCE_RELEVANCE = 0.5 * _LAST_GUIDANCE_RELEVANCE + 0.5 * relevance
+
+        # For visualization, store a detached CPU copy in the global buffer.
+        if _ATTENTION_VIS_ENABLED:
+            _append_attention_vis_vector(relevance)
     except Exception:
-        # Never break the main generation path due to visualization issues.
+        # Never break the main generation path due to visualization/guidance
+        # hooks.
         return
 
 
@@ -725,8 +756,10 @@ class PackedAttentionMoT(Qwen2Attention):
         if mode == 'und':
             packed_attn_output = self.o_proj(packed_attn_output)
         elif mode == 'gen':
-            packed_attn_output[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
-            packed_attn_output[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
+            proj_out = packed_attn_output.new_zeros(packed_attn_output.shape)
+            proj_out[packed_text_indexes] = self.o_proj(packed_attn_output[packed_text_indexes])
+            proj_out[packed_vae_token_indexes] = self.o_proj_moe_gen(packed_attn_output[packed_vae_token_indexes])
+            packed_attn_output = proj_out
 
         if update_past_key_values:
             past_key_values.key_cache[self.layer_idx] = merged_key_states
