@@ -753,7 +753,6 @@ class Bagel(PreTrainedModel):
         unpacked_latent = x_t.split((packed_seqlens - 2).tolist())
         return unpacked_latent
 
-    @torch.no_grad
     def _forward_flow(
         self,
         x_t: torch.Tensor,

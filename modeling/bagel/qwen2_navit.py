@@ -47,6 +47,7 @@ flex_attention = torch.compile(flex_attention)
 _ATTENTION_VIS_ENABLED: bool = False
 _ATTENTION_VIS_VECTORS: list = []
 _ATTENTION_VIS_TOKEN_MAPS: list = []
+_ATTENTION_VIS_TOKEN_TO_VAE_MAPS: list = []
 
 # Global switch and buffer for gradient-based attention guidance. This is
 # intentionally separate from the visualization buffer so that guidance code
@@ -55,22 +56,34 @@ _ATTENTION_VIS_TOKEN_MAPS: list = []
 _ATTENTION_GUIDANCE_ENABLED: bool = False
 _LAST_GUIDANCE_RELEVANCE: Optional[torch.Tensor] = None
 _LAST_GUIDANCE_TOKEN_RELEVANCE: Optional[torch.Tensor] = None
+_LAST_GUIDANCE_TOKEN_TO_VAE: Optional[torch.Tensor] = None
+
+# 为 gradient-based guidance 维护严格等权平均的计数器
+_LAST_GUIDANCE_RELEVANCE_COUNT: int = 0
+_LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT: int = 0
+_LAST_GUIDANCE_TOKEN_TO_VAE_COUNT: int = 0
 
 
 def _enable_attention_vis_logging(flag: bool, clear: bool = False) -> None:
-    global _ATTENTION_VIS_ENABLED, _ATTENTION_VIS_VECTORS, _ATTENTION_VIS_TOKEN_MAPS
+    global _ATTENTION_VIS_ENABLED, _ATTENTION_VIS_VECTORS, _ATTENTION_VIS_TOKEN_MAPS, _ATTENTION_VIS_TOKEN_TO_VAE_MAPS
     _ATTENTION_VIS_ENABLED = bool(flag)
     if clear:
         _ATTENTION_VIS_VECTORS = []
         _ATTENTION_VIS_TOKEN_MAPS = []
+        _ATTENTION_VIS_TOKEN_TO_VAE_MAPS = []
 
 
 def _enable_attention_guidance_logging(flag: bool, clear: bool = False) -> None:
-    global _ATTENTION_GUIDANCE_ENABLED, _LAST_GUIDANCE_RELEVANCE, _LAST_GUIDANCE_TOKEN_RELEVANCE
+    global _ATTENTION_GUIDANCE_ENABLED, _LAST_GUIDANCE_RELEVANCE, _LAST_GUIDANCE_TOKEN_RELEVANCE, _LAST_GUIDANCE_TOKEN_TO_VAE
+    global _LAST_GUIDANCE_RELEVANCE_COUNT, _LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT, _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT
     _ATTENTION_GUIDANCE_ENABLED = bool(flag)
     if clear:
         _LAST_GUIDANCE_RELEVANCE = None
         _LAST_GUIDANCE_TOKEN_RELEVANCE = None
+        _LAST_GUIDANCE_TOKEN_TO_VAE = None
+        _LAST_GUIDANCE_RELEVANCE_COUNT = 0
+        _LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT = 0
+        _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT = 0
 
 
 def _append_attention_vis_vector(vec: torch.Tensor) -> None:
@@ -99,6 +112,20 @@ def _append_attention_vis_token_map(mat: torch.Tensor) -> None:
     if len(_ATTENTION_VIS_TOKEN_MAPS) >= 128:
         _ATTENTION_VIS_TOKEN_MAPS.pop(0)
     _ATTENTION_VIS_TOKEN_MAPS.append(mat)
+
+
+def _append_attention_vis_token_to_vae(mat: torch.Tensor) -> None:
+    global _ATTENTION_VIS_TOKEN_TO_VAE_MAPS
+    if not _ATTENTION_VIS_ENABLED:
+        return
+    if mat is None:
+        return
+    mat = mat.detach().float().cpu()
+    if mat.numel() == 0:
+        return
+    if len(_ATTENTION_VIS_TOKEN_TO_VAE_MAPS) >= 32:
+        _ATTENTION_VIS_TOKEN_TO_VAE_MAPS.pop(0)
+    _ATTENTION_VIS_TOKEN_TO_VAE_MAPS.append(mat)
 
 
 def _log_attention_for_vis_step(
@@ -137,11 +164,15 @@ def _log_attention_for_vis_step(
             return
 
         # Select the current-step text / VAE token representations.
-        q_text = q[text_idx]  # (T_text, H, D)
-        k_vae = k[vae_idx]    # (T_vae, H_kv, D)
+        # 为了获得“图像→文本”视角的 cross-attention，我们使用 VAE token
+        # 作为 query、文本 token 作为 key：这样每个文本 token 都对应一张
+        # 在 VAE 网格上的注意力图，更贴近 layout-guidance 中 image latent
+        # 对文本的对齐方式。
+        q_vae = q[vae_idx]    # (T_vae, H_q, D)
+        k_text = k[text_idx]  # (T_text, H_kv, D)
 
-        T_text, H_q, D = q_text.shape
-        T_vae, H_kv, Dk = k_vae.shape
+        T_vae, H_q, D = q_vae.shape
+        T_text, H_kv, Dk = k_text.shape
         if Dk != D or T_text == 0 or T_vae == 0:
             return
 
@@ -150,19 +181,26 @@ def _log_attention_for_vis_step(
             if H_kv == 0 or H_q % H_kv != 0:
                 return
             repeat = H_q // H_kv
-            k_vae = k_vae.repeat_interleave(repeat, dim=1)
+            k_text = k_text.repeat_interleave(repeat, dim=1)
 
-        # Compute approximate cross-attention: q·k^T / sqrt(d), then mean
-        # over text tokens and heads → (T_vae,).
-        q_text_heads = q_text  # (T_text, H, D)
-        k_vae_heads = k_vae    # (T_vae, H, D)
+        # Compute approximate cross-attention: q_img·k_text^T / sqrt(d).
+        # scores_v2t: (H, T_vae, T_text)。对 heads 取平均后，得到
+        #   s_mean: (T_vae, T_text)。为了保持与原接口一致：
+        #   - relevance       : 按文本平均后的 VAE 重要性向量 (T_vae,)
+        #   - token_relevance : 每个文本 token 的全局重要性 (T_text,)
+        #   - token_to_vae    : 每个文本 token 在空间上的注意力图 (T_text, T_vae)
+        q_img_heads = q_vae   # (T_vae, H_q, D)
+        k_txt_heads = k_text  # (T_text, H_q, D)
 
-        q_flat = q_text_heads.permute(1, 0, 2).reshape(H_q, T_text, D)
-        k_flat = k_vae_heads.permute(1, 0, 2).reshape(H_q, T_vae, D)
+        q_flat = q_img_heads.permute(1, 0, 2).reshape(H_q, T_vae, D)
+        k_flat = k_txt_heads.permute(1, 0, 2).reshape(H_q, T_text, D)
 
-        scores = torch.matmul(q_flat, k_flat.transpose(-1, -2)) / math.sqrt(D)
-        relevance = scores.mean(dim=1).mean(dim=0)  # (T_vae,)
-        token_relevance = scores.mean(dim=0).mean(dim=-1)  # (T_text,)
+        scores_v2t = torch.matmul(q_flat, k_flat.transpose(-1, -2)) / math.sqrt(D)
+        s_mean = scores_v2t.mean(dim=0)          # (T_vae, T_text)
+
+        relevance = s_mean.mean(dim=1)           # (T_vae,)
+        token_relevance = s_mean.mean(dim=0)     # (T_text,)
+        token_to_vae = s_mean.transpose(0, 1)    # (T_text, T_vae)
 
         if relevance.numel() == 0:
             return
@@ -182,30 +220,65 @@ def _log_attention_for_vis_step(
         else:
             token_relevance = None
 
+        if token_to_vae.numel() > 0:
+            token_to_vae = token_to_vae.to(torch.float32)
+        else:
+            token_to_vae = None
+
         # For gradient-based guidance, keep a full-precision tensor alive for
-        # the current step. When multiple attention modules call this helper
-        # within a single step, we progressively average their contributions.
+        # the current step. 当多个 attention 模块在同一 step 内调用本函数时，
+        # 使用严格等权平均而非 EMA 聚合它们的贡献。
         if _ATTENTION_GUIDANCE_ENABLED:
+            global _LAST_GUIDANCE_RELEVANCE_COUNT, _LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT, _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT
             if _LAST_GUIDANCE_RELEVANCE is None:
                 _LAST_GUIDANCE_RELEVANCE = relevance
+                _LAST_GUIDANCE_RELEVANCE_COUNT = 1
             else:
-                _LAST_GUIDANCE_RELEVANCE = 0.5 * _LAST_GUIDANCE_RELEVANCE + 0.5 * relevance
+                n = _LAST_GUIDANCE_RELEVANCE_COUNT
+                _LAST_GUIDANCE_RELEVANCE = (_LAST_GUIDANCE_RELEVANCE * n + relevance) / float(n + 1)
+                _LAST_GUIDANCE_RELEVANCE_COUNT = n + 1
+
             if token_relevance is not None:
-                global _LAST_GUIDANCE_TOKEN_RELEVANCE
+                global _LAST_GUIDANCE_TOKEN_RELEVANCE, _LAST_GUIDANCE_TOKEN_TO_VAE
                 if _LAST_GUIDANCE_TOKEN_RELEVANCE is None:
                     _LAST_GUIDANCE_TOKEN_RELEVANCE = token_relevance
+                    _LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT = 1
                 else:
+                    n_tok = _LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT
                     _LAST_GUIDANCE_TOKEN_RELEVANCE = (
-                        0.5 * _LAST_GUIDANCE_TOKEN_RELEVANCE + 0.5 * token_relevance
-                    )
+                        _LAST_GUIDANCE_TOKEN_RELEVANCE * n_tok + token_relevance
+                    ) / float(n_tok + 1)
+                    _LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT = n_tok + 1
             else:
                 _LAST_GUIDANCE_TOKEN_RELEVANCE = None
+                _LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT = 0
+                _LAST_GUIDANCE_TOKEN_TO_VAE = None
+                _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT = 0
+
+            if token_to_vae is not None:
+                if _LAST_GUIDANCE_TOKEN_TO_VAE is None:
+                    _LAST_GUIDANCE_TOKEN_TO_VAE = token_to_vae
+                    _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT = 1
+                else:
+                    n_map = _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT
+                    _LAST_GUIDANCE_TOKEN_TO_VAE = (
+                        _LAST_GUIDANCE_TOKEN_TO_VAE * n_map + token_to_vae
+                    ) / float(n_map + 1)
+                    _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT = n_map + 1
+            elif token_relevance is not None:
+                # token relevance exists but token-to-vae map missing; keep previous map only if already set
+                pass
+            else:
+                _LAST_GUIDANCE_TOKEN_TO_VAE = None
+                _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT = 0
 
         # For visualization, store a detached CPU copy in the global buffer.
         if _ATTENTION_VIS_ENABLED:
             _append_attention_vis_vector(relevance)
             if token_relevance is not None:
                 _append_attention_vis_token_map(token_relevance)
+            if token_to_vae is not None:
+                _append_attention_vis_token_to_vae(token_to_vae)
     except Exception:
         # Never break the main generation path due to visualization/guidance
         # hooks.
@@ -1177,6 +1250,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         self.log_attention_for_vis: bool = False
         self.attention_vectors_for_vis: list = []
         self.attention_token_vectors_for_vis: list = []
+        self.attention_token_to_vae_maps_for_vis: list = []
 
     def clear_attention_logs_for_vis(self) -> None:
         """Clear stored attention vectors used only for visualization.
@@ -1186,6 +1260,7 @@ class Qwen2Model(Qwen2PreTrainedModel):
         """
         self.attention_vectors_for_vis = []
         self.attention_token_vectors_for_vis = []
+        self.attention_token_to_vae_maps_for_vis = []
         # Also clear any global visualization buffer to keep them in sync.
         _enable_attention_vis_logging(False, clear=True)
 
@@ -1322,14 +1397,16 @@ class Qwen2Model(Qwen2PreTrainedModel):
         
         # Snapshot any collected visualization vectors into the model-level
         # buffer so that downstream consumers (e.g. UMM) can access them.
-        global _ATTENTION_VIS_VECTORS, _ATTENTION_VIS_TOKEN_MAPS
+        global _ATTENTION_VIS_VECTORS, _ATTENTION_VIS_TOKEN_MAPS, _ATTENTION_VIS_TOKEN_TO_VAE_MAPS
         if self.log_attention_for_vis:
             # Make a shallow copy to decouple from the global buffer.
             self.attention_vectors_for_vis = list(_ATTENTION_VIS_VECTORS)
             self.attention_token_vectors_for_vis = list(_ATTENTION_VIS_TOKEN_MAPS)
+            self.attention_token_to_vae_maps_for_vis = list(_ATTENTION_VIS_TOKEN_TO_VAE_MAPS)
         else:
             self.attention_vectors_for_vis = []
             self.attention_token_vectors_for_vis = []
+            self.attention_token_to_vae_maps_for_vis = []
 
         return BaseNavitOutputWithPast(
             packed_query_sequence=packed_query_sequence,
