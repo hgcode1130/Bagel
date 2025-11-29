@@ -58,7 +58,7 @@ _LAST_GUIDANCE_RELEVANCE: Optional[torch.Tensor] = None
 _LAST_GUIDANCE_TOKEN_RELEVANCE: Optional[torch.Tensor] = None
 _LAST_GUIDANCE_TOKEN_TO_VAE: Optional[torch.Tensor] = None
 
-# 为 gradient-based guidance 维护严格等权平均的计数器
+# Counters for equal-weight averaging in gradient-based guidance
 _LAST_GUIDANCE_RELEVANCE_COUNT: int = 0
 _LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT: int = 0
 _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT: int = 0
@@ -84,6 +84,11 @@ def _enable_attention_guidance_logging(flag: bool, clear: bool = False) -> None:
         _LAST_GUIDANCE_RELEVANCE_COUNT = 0
         _LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT = 0
         _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT = 0
+        # 重置调试打印标志
+        if hasattr(_log_attention_for_vis_step, '_debug_printed'):
+            _log_attention_for_vis_step._debug_printed = False
+        if hasattr(_log_attention_for_vis_step, '_mask_printed'):
+            _log_attention_for_vis_step._mask_printed = False
 
 
 def _append_attention_vis_vector(vec: torch.Tensor) -> None:
@@ -163,6 +168,18 @@ def _log_attention_for_vis_step(
         if text_idx.numel() == 0 or vae_idx.numel() == 0:
             return
 
+        # 调试：打印 text_idx 和 vae_idx 的信息（仅在 guidance 模式下打印一次）
+        global _DEBUG_PRINTED
+        if not hasattr(_log_attention_for_vis_step, '_debug_printed'):
+            _log_attention_for_vis_step._debug_printed = False
+        if _ATTENTION_GUIDANCE_ENABLED and not _log_attention_for_vis_step._debug_printed:
+            print(f"\n🔍 [DEBUG] _log_attention_for_vis_step:")
+            print(f"🔍 [DEBUG]   packed_query_states.shape: {packed_query_states.shape}")
+            print(f"🔍 [DEBUG]   packed_key_states.shape: {packed_key_states.shape}")
+            print(f"🔍 [DEBUG]   text_idx (len={text_idx.numel()}): {text_idx.tolist()}")
+            print(f"🔍 [DEBUG]   vae_idx (len={vae_idx.numel()}): {vae_idx.tolist()[:10]}{'...' if vae_idx.numel() > 10 else ''}")
+            _log_attention_for_vis_step._debug_printed = True
+
         # Select the current-step text / VAE token representations.
         # 为了获得“图像→文本”视角的 cross-attention，我们使用 VAE token
         # 作为 query、文本 token 作为 key：这样每个文本 token 都对应一张
@@ -183,105 +200,132 @@ def _log_attention_for_vis_step(
             repeat = H_q // H_kv
             k_text = k_text.repeat_interleave(repeat, dim=1)
 
-        # Compute approximate cross-attention: q_img·k_text^T / sqrt(d).
-        # scores_v2t: (H, T_vae, T_text)。对 heads 取平均后，得到
-        #   s_mean: (T_vae, T_text)。为了保持与原接口一致：
-        #   - relevance       : 按文本平均后的 VAE 重要性向量 (T_vae,)
-        #   - token_relevance : 每个文本 token 的全局重要性 (T_text,)
-        #   - token_to_vae    : 每个文本 token 在空间上的注意力图 (T_text, T_vae)
-        q_img_heads = q_vae   # (T_vae, H_q, D)
-        k_txt_heads = k_text  # (T_text, H_q, D)
+        q_flat = q_vae.permute(1, 0, 2)   # (H_q, T_vae, D)
+        k_flat = k_text.permute(1, 0, 2)  # (H_q, T_text, D)
 
-        q_flat = q_img_heads.permute(1, 0, 2).reshape(H_q, T_vae, D)
-        k_flat = k_txt_heads.permute(1, 0, 2).reshape(H_q, T_text, D)
+        # Compute attention scores: VAE tokens attend to text tokens
+        # scores shape: (H_q, T_vae, T_text)
+        # 与 Layout-Guidance 一致：query 来自 image (VAE)，key 来自 text
+        scores = torch.matmul(q_flat, k_flat.transpose(-1, -2)) / math.sqrt(D)
+        
+        # 排除特殊 tokens (start_of_image, end_of_image) 的 attention
+        # 这些特殊 tokens 的 attention 值很高，会压制语义 tokens 的 attention
+        # text_idx 的结构：[prompt_tokens..., start_of_image, end_of_image]
+        # 在 _build_guidance_sequence_with_prompt 中，prompt tokens 在前面，
+        # start_of_image 和 end_of_image 是最后 2 个 tokens
+        # 所以 num_prompt_tokens = T_text - 2
+        
+        num_prompt_tokens = max(1, T_text - 2)  # 至少保留 1 个 token
+        
+        # 只对 prompt tokens 进行 softmax，mask 掉特殊 tokens
+        if num_prompt_tokens < T_text:
+            # 创建 mask：prompt tokens = 0, 特殊 tokens = -inf
+            mask = torch.zeros(T_text, device=scores.device, dtype=scores.dtype)
+            mask[num_prompt_tokens:] = float('-inf')
+            scores = scores + mask.view(1, 1, T_text)  # broadcast to (H_q, T_vae, T_text)
+            
+            if _ATTENTION_GUIDANCE_ENABLED and not getattr(_log_attention_for_vis_step, '_mask_printed', False):
+                print(f"🔍 [DEBUG] 排除特殊 tokens: 只保留前 {num_prompt_tokens}/{T_text} 个 prompt tokens (mask 掉 start_of_image 和 end_of_image)")
+                _log_attention_for_vis_step._mask_printed = True
+        
+        # Softmax over text dimension (dim=-1), same as Layout-Guidance
+        # 每个 VAE token 的 attention 分布在语义 text tokens 上（特殊 tokens 被 mask 掉）
+        attn_probs = torch.softmax(scores, dim=-1)  # (H_q, T_vae, T_text)
 
-        scores_v2t = torch.matmul(q_flat, k_flat.transpose(-1, -2)) / math.sqrt(D)
-        s_mean = scores_v2t.mean(dim=0)          # (T_vae, T_text)
+        # Average over heads
+        attn_map = attn_probs.mean(dim=0)  # (T_vae, T_text)
 
-        relevance = s_mean.mean(dim=1)           # (T_vae,)
-        token_relevance = s_mean.mean(dim=0)     # (T_text,)
-        token_to_vae = s_mean.transpose(0, 1)    # (T_text, T_vae)
+        # Compute relevance metrics
+        relevance = attn_map.mean(dim=1)           # (T_vae,) per-VAE-token importance
+        token_relevance = attn_map.mean(dim=0)     # (T_text,) per-text-token importance
+        
+        # token_to_vae: (T_text, T_vae) - 转置后，每行是一个 text token 对应的 VAE attention map
+        # 注意：这里不需要再做 softmax，因为 Layout-Guidance 的 loss 计算也是直接使用
+        # softmax(dim=-1) 后的结果，然后取特定 text token 的列
+        token_to_vae = attn_map.transpose(0, 1)  # (T_text, T_vae)
 
         if relevance.numel() == 0:
             return
-        # Normalize to [0,1] for both visualization and guidance.
-        relevance = relevance.to(torch.float32)
-        rel_min = float(relevance.min().item())
-        rel_max = float(relevance.max().item())
-        if rel_max - rel_min > 1e-8:
-            relevance = (relevance - rel_min) / (rel_max - rel_min)
-
-        if token_relevance.numel() > 0:
-            token_relevance = token_relevance.to(torch.float32)
-            tok_min = float(token_relevance.min().item())
-            tok_max = float(token_relevance.max().item())
-            if tok_max - tok_min > 1e-8:
-                token_relevance = (token_relevance - tok_min) / (tok_max - tok_min)
-        else:
-            token_relevance = None
-
-        if token_to_vae.numel() > 0:
-            token_to_vae = token_to_vae.to(torch.float32)
-        else:
-            token_to_vae = None
-
-        # For gradient-based guidance, keep a full-precision tensor alive for
-        # the current step. 当多个 attention 模块在同一 step 内调用本函数时，
-        # 使用严格等权平均而非 EMA 聚合它们的贡献。
+        
+        # 关键修复：在 guidance 模式下，不进行归一化（归一化会断开梯度链）
+        # 直接使用原始的 attention map 进行 loss 计算
+        # 归一化会在 loss 计算中通过 activation = sum_bbox / sum_all 隐式完成
         if _ATTENTION_GUIDANCE_ENABLED:
+            # 对于 guidance，保持原始 attention 值，不归一化，保持梯度连接
+            relevance_for_guidance = relevance.to(torch.float32)
+            token_relevance_for_guidance = token_relevance.to(torch.float32) if token_relevance.numel() > 0 else None
+            token_to_vae_for_guidance = token_to_vae.to(torch.float32) if token_to_vae.numel() > 0 else None
+            
             global _LAST_GUIDANCE_RELEVANCE_COUNT, _LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT, _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT
+            
+            # 使用 torch 操作保持计算图连接
+            # 注意：只累积相同 shape 的 tensors，避免 CFG forward 时的 shape mismatch
             if _LAST_GUIDANCE_RELEVANCE is None:
-                _LAST_GUIDANCE_RELEVANCE = relevance
+                _LAST_GUIDANCE_RELEVANCE = relevance_for_guidance
                 _LAST_GUIDANCE_RELEVANCE_COUNT = 1
-            else:
+            elif _LAST_GUIDANCE_RELEVANCE.shape == relevance_for_guidance.shape:
                 n = _LAST_GUIDANCE_RELEVANCE_COUNT
-                _LAST_GUIDANCE_RELEVANCE = (_LAST_GUIDANCE_RELEVANCE * n + relevance) / float(n + 1)
+                _LAST_GUIDANCE_RELEVANCE = (_LAST_GUIDANCE_RELEVANCE * n + relevance_for_guidance) / (n + 1)
                 _LAST_GUIDANCE_RELEVANCE_COUNT = n + 1
+            # else: shape mismatch, skip accumulation (likely from CFG forward)
 
-            if token_relevance is not None:
+            if token_relevance_for_guidance is not None:
                 global _LAST_GUIDANCE_TOKEN_RELEVANCE, _LAST_GUIDANCE_TOKEN_TO_VAE
                 if _LAST_GUIDANCE_TOKEN_RELEVANCE is None:
-                    _LAST_GUIDANCE_TOKEN_RELEVANCE = token_relevance
+                    _LAST_GUIDANCE_TOKEN_RELEVANCE = token_relevance_for_guidance
                     _LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT = 1
-                else:
+                elif _LAST_GUIDANCE_TOKEN_RELEVANCE.shape == token_relevance_for_guidance.shape:
                     n_tok = _LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT
                     _LAST_GUIDANCE_TOKEN_RELEVANCE = (
-                        _LAST_GUIDANCE_TOKEN_RELEVANCE * n_tok + token_relevance
-                    ) / float(n_tok + 1)
+                        _LAST_GUIDANCE_TOKEN_RELEVANCE * n_tok + token_relevance_for_guidance
+                    ) / (n_tok + 1)
                     _LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT = n_tok + 1
+                # else: shape mismatch, skip accumulation
             else:
                 _LAST_GUIDANCE_TOKEN_RELEVANCE = None
                 _LAST_GUIDANCE_TOKEN_RELEVANCE_COUNT = 0
-                _LAST_GUIDANCE_TOKEN_TO_VAE = None
-                _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT = 0
 
-            if token_to_vae is not None:
+            if token_to_vae_for_guidance is not None:
                 if _LAST_GUIDANCE_TOKEN_TO_VAE is None:
-                    _LAST_GUIDANCE_TOKEN_TO_VAE = token_to_vae
+                    _LAST_GUIDANCE_TOKEN_TO_VAE = token_to_vae_for_guidance
                     _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT = 1
-                else:
+                elif _LAST_GUIDANCE_TOKEN_TO_VAE.shape == token_to_vae_for_guidance.shape:
                     n_map = _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT
                     _LAST_GUIDANCE_TOKEN_TO_VAE = (
-                        _LAST_GUIDANCE_TOKEN_TO_VAE * n_map + token_to_vae
-                    ) / float(n_map + 1)
+                        _LAST_GUIDANCE_TOKEN_TO_VAE * n_map + token_to_vae_for_guidance
+                    ) / (n_map + 1)
                     _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT = n_map + 1
-            elif token_relevance is not None:
-                # token relevance exists but token-to-vae map missing; keep previous map only if already set
-                pass
+                # else: shape mismatch, skip accumulation
             else:
                 _LAST_GUIDANCE_TOKEN_TO_VAE = None
                 _LAST_GUIDANCE_TOKEN_TO_VAE_COUNT = 0
 
         # For visualization, store a detached CPU copy in the global buffer.
+        # 可视化模式下进行归一化并 detach，因为不需要梯度
         if _ATTENTION_VIS_ENABLED:
-            _append_attention_vis_vector(relevance)
-            if token_relevance is not None:
-                _append_attention_vis_token_map(token_relevance)
-            if token_to_vae is not None:
-                _append_attention_vis_token_to_vae(token_to_vae)
-    except Exception:
+            relevance_vis = relevance.detach().to(torch.float32)
+            rel_min = float(relevance_vis.min().item())
+            rel_max = float(relevance_vis.max().item())
+            if rel_max - rel_min > 1e-8:
+                relevance_vis = (relevance_vis - rel_min) / (rel_max - rel_min)
+            _append_attention_vis_vector(relevance_vis)
+            
+            if token_relevance.numel() > 0:
+                token_relevance_vis = token_relevance.detach().to(torch.float32)
+                tok_min = float(token_relevance_vis.min().item())
+                tok_max = float(token_relevance_vis.max().item())
+                if tok_max - tok_min > 1e-8:
+                    token_relevance_vis = (token_relevance_vis - tok_min) / (tok_max - tok_min)
+                _append_attention_vis_token_map(token_relevance_vis)
+            
+            if token_to_vae.numel() > 0:
+                _append_attention_vis_token_to_vae(token_to_vae.detach())
+                
+    except Exception as e:
         # Never break the main generation path due to visualization/guidance
-        # hooks.
+        # hooks. But log the error for debugging.
+        import sys
+        print(f"[WARNING] _log_attention_for_vis_step error: {e}", file=sys.stderr)
         return
 
 
@@ -580,19 +624,7 @@ class PackedAttention(Qwen2Attention):
         packed_key_states = packed_key_states.to(torch.bfloat16)
         packed_value_states = packed_value_states.to(torch.bfloat16)
 
-        # Lightweight visualization hook for MoT path: when global logging
-        # is enabled and we are in generation mode, compute an approximate
-        # text→image relevance vector over current VAE tokens.
-        _log_attention_for_vis_step(
-            packed_query_states,
-            packed_key_states,
-            packed_vae_token_indexes,
-            packed_text_indexes,
-        )
-
-        # Lightweight visualization hook: when global logging is enabled and
-        # MoT is in generation mode, compute an approximate text→image
-        # relevance vector over current VAE tokens.
+        # Lightweight visualization hook: compute text→image relevance when logging is enabled
         _log_attention_for_vis_step(
             packed_query_states,
             packed_key_states,
